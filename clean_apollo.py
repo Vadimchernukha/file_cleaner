@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import anthropic
@@ -132,6 +133,55 @@ def clean_company_text(name: str) -> str:
 def clean_title_text(title: str) -> str:
     """Transliterate diacritics in titles (no caps-fix needed)."""
     return _transliterate(str(title) if title else "")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A. Name Cleaning
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clean_name(val) -> str:
+    if pd.isna(val) or not str(val).strip():
+        return ""
+    name = str(val).strip()
+    # ALL CAPS → Title Case (e.g. "JOHN" → "John", "VAN DEN BERG" → "Van Den Berg")
+    if name.isupper():
+        name = name.title()
+    # Strip diacritics for names: é→e, ä→a, ö→o, ü→u (not German ae/oe/ue convention)
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    # Collapse multiple spaces
+    name = re.sub(r" {2,}", " ", name)
+    return name.strip()
+
+
+def clean_names(df: pd.DataFrame) -> pd.DataFrame:
+    before_first = df["First Name"].copy()
+    before_last  = df["Last Name"].copy()
+    df["First Name"] = df["First Name"].apply(_clean_name)
+    df["Last Name"]  = df["Last Name"].apply(_clean_name)
+    changed = ((df["First Name"] != before_first.fillna("")) |
+               (df["Last Name"]  != before_last.fillna(""))).sum()
+    log.info("Names cleaned (%d rows changed)", changed)
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B. Deduplication
+# ══════════════════════════════════════════════════════════════════════════════
+
+def deduplicate_contacts(df: pd.DataFrame) -> pd.DataFrame:
+    before = len(df)
+    # Rows with a non-empty email: keep first occurrence, drop the rest
+    has_email = df["Email"].notna() & (df["Email"].str.strip() != "")
+    email_norm = df["Email"].str.strip().str.lower()
+    is_dup = has_email & email_norm.duplicated(keep="first")
+    removed = is_dup.sum()
+    df = df[~is_dup].copy().reset_index(drop=True)
+    if removed:
+        log.info("Deduplication: removed %d duplicate email(s) (%d → %d rows)",
+                 removed, before, len(df))
+    else:
+        log.info("Deduplication: no duplicates found")
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -635,6 +685,12 @@ async def main() -> None:
 
     # 1. Load & filter
     df = load_and_filter(INPUT_FILE)
+
+    # 1a. Clean names (ALL CAPS, diacritics)
+    df = clean_names(df)
+
+    # 1b. Remove duplicate emails (keep first occurrence)
+    df = deduplicate_contacts(df)
 
     # 2. Clean URLs
     df = clean_urls(df)
